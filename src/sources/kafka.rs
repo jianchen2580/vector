@@ -21,6 +21,64 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use vector_core::event::{BatchNotifier, LogEvent, Value};
 
+use avro_rs::types::Value as AvroValue;
+use serde_json::{Number, Value as JsonValue};
+use schema_registry_converter::async_impl::avro::AvroDecoder;
+use schema_registry_converter::async_impl::schema_registry::SrSettings;
+
+use std::convert::TryFrom;
+use avro_rs::Error as AvroError;
+use avro_rs::AvroResult;
+
+fn try_from(value: AvroValue) -> AvroResult <JsonValue> {
+    match value {
+        AvroValue::Null => Ok(JsonValue::Null),
+        AvroValue::Boolean(b) => Ok(JsonValue::Bool(b)),
+        AvroValue::Int(i) => Ok(JsonValue::Number(i.into())),
+        AvroValue::Long(l) => Ok(JsonValue::Number(l.into())),
+        AvroValue::Float(f) => Number::from_f64(f.into())
+            .map(JsonValue::Number)
+            .ok_or_else(|| AvroError::ConvertF64ToJson(f.into())),
+        AvroValue::Double(d) => Number::from_f64(d)
+            .map(JsonValue::Number)
+            .ok_or(AvroError::ConvertF64ToJson(d)),
+        AvroValue::Bytes(bytes) => Ok(JsonValue::Array(bytes.into_iter().map(|b| b.into()).collect())),
+        AvroValue::String(s) => Ok(JsonValue::String(s)),
+        AvroValue::Fixed(_size, items) => {
+            Ok(JsonValue::Array(items.into_iter().map(|v| v.into()).collect()))
+        }
+        AvroValue::Enum(_i, s) => Ok(JsonValue::String(s)),
+        AvroValue::Union(b) => JsonValue::try_from(*b),
+        AvroValue::Array(items) => items
+            .into_iter()
+            .map(JsonValue::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map(JsonValue::Array),
+        AvroValue::Map(items) => items
+            .into_iter()
+            .map(|(key, value)| JsonValue::try_from(value).map(|v| (key, v)))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|v| JsonValue::Object(v.into_iter().collect())),
+        AvroValue::Record(items) => items
+            .into_iter()
+            .map(|(key, value)| JsonValue::try_from(value).map(|v| (key, v)))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|v| JsonValue::Object(v.into_iter().collect())),
+        AvroValue::Date(d) => Ok(JsonValue::Number(d.into())),
+        AvroValue::Decimal(ref d) => <Vec<u8>>::try_from(d)
+            .map(|vec| JsonValue::Array(vec.into_iter().map(|v| v.into()).collect())),
+        AvroValue::TimeMillis(t) => Ok(JsonValue::Number(t.into())),
+        AvroValue::TimeMicros(t) => Ok(JsonValue::Number(t.into())),
+        AvroValue::TimestampMillis(t) => Ok(JsonValue::Number(t.into())),
+        AvroValue::TimestampMicros(t) => Ok(JsonValue::Number(t.into())),
+        AvroValue::Duration(d) => Ok(JsonValue::Array(
+            <[u8; 12]>::from(d).iter().map(|&v| v.into()).collect(),
+        )),
+        AvroValue::Uuid(uuid) => Ok(JsonValue::String(uuid.to_hyphenated().to_string())),
+    }
+}
+
+
 #[derive(Debug, Snafu)]
 enum BuildError {
     #[snafu(display("Could not create Kafka consumer: {}", source))]
@@ -34,6 +92,7 @@ enum BuildError {
 pub struct KafkaSourceConfig {
     bootstrap_servers: String,
     topics: Vec<String>,
+    schema_registry: String,
     group_id: String,
     #[serde(default = "default_auto_offset_reset")]
     auto_offset_reset: String,
@@ -119,6 +178,7 @@ impl SourceConfig for KafkaSourceConfig {
             self.partition_key.clone(),
             self.offset_key.clone(),
             self.headers_key.clone(),
+            self.schema_registry.clone(),
             cx.shutdown,
             cx.out,
             cx.acknowledgements,
@@ -141,12 +201,17 @@ async fn kafka_source(
     partition_key: String,
     offset_key: String,
     headers_key: String,
+    schema_registry: String,
     shutdown: ShutdownSignal,
     mut out: Pipeline,
     acknowledgements: bool,
 ) -> Result<(), ()> {
     let consumer = Arc::new(consumer);
     let shutdown = shutdown.shared();
+
+    let sr_settings = SrSettings::new(schema_registry);
+    let mut decoder = AvroDecoder::new(sr_settings);
+
     let mut finalizer = acknowledgements
         .then(|| OrderedFinalizer::new(shutdown.clone(), mark_done(Arc::clone(&consumer))));
     let mut stream = consumer.stream().take_until(shutdown);
@@ -160,16 +225,29 @@ async fn kafka_source(
                 emit!(KafkaEventReceived {
                     byte_size: msg.payload_len()
                 });
-
                 let payload = match msg.payload() {
                     None => continue, // skip messages with empty payload
-                    Some(payload) => payload,
+                    Some(payload) => {
+                        let des_r = decoder.decode(Some(payload)).await.unwrap();
+                        let payload_value =des_r.value.clone();
+
+                        if let AvroValue::Record(fields) = payload_value {
+                            let result = fields.into_iter()
+                                .map(|(field, value)| (field, try_from(value).unwrap()))
+                                .collect::<std::collections::HashMap<_, _>>();
+
+                            serde_json::to_string(&result).unwrap()
+
+                        } else {
+                            continue;
+                        }
+                    },
                 };
                 let mut log = LogEvent::default();
 
                 log.insert(
                     log_schema().message_key(),
-                    Value::from(Bytes::from(payload.to_owned())),
+                    Value::from(payload),
                 );
 
                 // Extract timestamp from kafka message

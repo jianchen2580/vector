@@ -6430,6 +6430,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "schema_registry_converter"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19c7aae10131bb753c8f50e71d3a4ad44c561f9d2618205c78be2715e2bc29b3"
+dependencies = [
+ "avro-rs",
+ "byteorder",
+ "failure",
+ "futures 0.3.16",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8380,6 +8396,7 @@ dependencies = [
  "rusoto_sqs",
  "rusoto_sts",
  "schannel",
+ "schema_registry_converter",
  "seahash",
  "security-framework",
  "semver 1.0.4",
