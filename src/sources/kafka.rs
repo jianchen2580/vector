@@ -93,6 +93,7 @@ pub struct KafkaSourceConfig {
     bootstrap_servers: String,
     topics: Vec<String>,
     schema_registry: String,
+    avro: bool,
     group_id: String,
     #[serde(default = "default_auto_offset_reset")]
     auto_offset_reset: String,
@@ -179,6 +180,7 @@ impl SourceConfig for KafkaSourceConfig {
             self.offset_key.clone(),
             self.headers_key.clone(),
             self.schema_registry.clone(),
+            self.avro.clone(),
             cx.shutdown,
             cx.out,
             cx.acknowledgements,
@@ -202,6 +204,7 @@ async fn kafka_source(
     offset_key: String,
     headers_key: String,
     schema_registry: String,
+    avro: bool,
     shutdown: ShutdownSignal,
     mut out: Pipeline,
     acknowledgements: bool,
@@ -228,18 +231,23 @@ async fn kafka_source(
                 let payload = match msg.payload() {
                     None => continue, // skip messages with empty payload
                     Some(payload) => {
-                        let des_r = decoder.decode(Some(payload)).await.unwrap();
-                        let payload_value =des_r.value.clone();
-
-                        if let AvroValue::Record(fields) = payload_value {
-                            let result = fields.into_iter()
-                                .map(|(field, value)| (field, try_from(value).unwrap()))
-                                .collect::<std::collections::HashMap<_, _>>();
-
-                            serde_json::to_string(&result).unwrap()
-
+                        if avro {
+                            let des_r = decoder.decode(Some(payload)).await.unwrap();
+                            let payload_value =des_r.value.clone();
+    
+                            if let AvroValue::Record(fields) = payload_value {
+                                let result = fields.into_iter()
+                                    .map(|(field, value)| (field, try_from(value).unwrap()))
+                                    .collect::<std::collections::HashMap<_, _>>();
+    
+                                serde_json::to_string(&result).unwrap()
+    
+                            } else {
+                                continue;
+                            }
                         } else {
-                            continue;
+                            // Bytes::from(payload.to_owned())
+                            String::from_utf8_lossy(payload).to_string()
                         }
                     },
                 };
